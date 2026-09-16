@@ -29,9 +29,8 @@ RECOVERY_BATCH = int(os.environ.get("RECOVERY_BATCH", "100"))
 RECOVERY_STUCK_MINUTES = int(os.environ.get("RECOVERY_STUCK_MINUTES", "5"))
 HTTP_TIMEOUT = float(os.environ.get("HTTP_TIMEOUT", "10"))
 
-# Rate limit для /api/v1/orders
-ORDER_RATE_LIMIT = int(os.environ.get("ORDER_RATE_LIMIT", "30"))     # запросов
-ORDER_RATE_WINDOW = int(os.environ.get("ORDER_RATE_WINDOW", "60"))   # за 60 секунд
+ORDER_RATE_LIMIT = int(os.environ.get("ORDER_RATE_LIMIT", "30"))
+ORDER_RATE_WINDOW = int(os.environ.get("ORDER_RATE_WINDOW", "60"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -77,7 +76,7 @@ class OutboxModel(Base):
         default=lambda: datetime.now(timezone.utc),
         onupdate=lambda: datetime.now(timezone.utc),
         nullable=False,
-        index=True,  # нужно для recovery daemon (WHERE updated_at < bound)
+        index=True,
     )
 
 
@@ -143,7 +142,6 @@ _UNSET = object()
 
 
 def _sanitize_log(value: str, limit: int = 500) -> str:
-    """Убираем управляющие символы и обрезаем до limit."""
     if value is None:
         return ""
     return re.sub(r"[\r\n\t]", " ", str(value))[:limit]
@@ -198,8 +196,6 @@ class ResilientSyncEngine:
         if attempt is not None:
             values["attempt"] = attempt
         if touch_updated_at:
-            # Явно, потому что SQLAlchemy onupdate не всегда срабатывает
-            # через session.execute(update(...))
             values["updated_at"] = datetime.now(timezone.utc)
         if not values:
             return
@@ -261,7 +257,6 @@ class ResilientSyncEngine:
                 err = f"internal: {type(e).__name__}"
                 retryable = False
 
-            # Финальная попытка или неретраимая ошибка → один UPDATE
             if not retryable or attempt == max_retries:
                 await self._persist(
                     order_id,
@@ -272,7 +267,6 @@ class ResilientSyncEngine:
                 logger.error("[SYNC-FAILED] job=%s err=%s", order_id, err)
                 return False
 
-            # Промежуточная запись — только ошибка и номер попытки
             await self._persist(order_id, error_log=err, attempt=attempt)
             await asyncio.sleep(delay)
             delay *= 2
@@ -306,10 +300,6 @@ async def auto_recovery_daemon() -> None:
                         .limit(RECOVERY_BATCH)
                         .scalar_subquery()
                     )
-                    # ВАЖНО: защита от race condition между воркерами.
-                    # Обновляем только те, что ещё не в RECOVERING.
-                    # В single-worker SQLite это подстраховка,
-                    # в multi-worker Postgres — обязательное условие.
                     stmt = (
                         update(OutboxModel)
                         .where(OutboxModel.order_id.in_(subq))
@@ -422,7 +412,6 @@ async def create_secure_order(
     response: Response,
     x_idempotency_key: Optional[str] = Header(None, max_length=255),
 ):
-    # Rate limit по IP
     client_ip = request.client.host if request.client else "unknown"
     if not check_order_rate(client_ip):
         raise HTTPException(
