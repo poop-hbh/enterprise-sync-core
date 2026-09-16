@@ -6,19 +6,20 @@ import os
 import re
 import uuid
 from contextlib import asynccontextmanager
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from time import time as _time
 from typing import Optional, Set
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Response
+from fastapi import FastAPI, Header, HTTPException, Request, Response
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import DateTime, Numeric, String, delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 # ---------------- Config ----------------
-# SQLite-файл рядом с main.py. Ничего устанавливать не надо.
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite+aiosqlite:///./app.db")
 SYNC_ENDPOINT = os.environ.get("SYNC_ENDPOINT", "https://httpbin.org/post")
 RECOVERY_INTERVAL = int(os.environ.get("RECOVERY_INTERVAL", "15"))
@@ -28,6 +29,10 @@ RECOVERY_BATCH = int(os.environ.get("RECOVERY_BATCH", "100"))
 RECOVERY_STUCK_MINUTES = int(os.environ.get("RECOVERY_STUCK_MINUTES", "5"))
 HTTP_TIMEOUT = float(os.environ.get("HTTP_TIMEOUT", "10"))
 
+# Rate limit для /api/v1/orders
+ORDER_RATE_LIMIT = int(os.environ.get("ORDER_RATE_LIMIT", "30"))     # запросов
+ORDER_RATE_WINDOW = int(os.environ.get("ORDER_RATE_WINDOW", "60"))   # за 60 секунд
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - [%(levelname)s] - %(name)s - %(message)s",
@@ -35,7 +40,6 @@ logging.basicConfig(
 logger = logging.getLogger("EnterpriseSyncCore")
 
 # ---------------- Engine ----------------
-# Для SQLite pool_size/max_overflow не поддерживаются — используем дефолтный NullPool.
 engine = create_async_engine(DATABASE_URL, pool_pre_ping=True)
 AsyncSessionLocal = async_sessionmaker(
     bind=engine, class_=AsyncSession, expire_on_commit=False
@@ -73,6 +77,7 @@ class OutboxModel(Base):
         default=lambda: datetime.now(timezone.utc),
         onupdate=lambda: datetime.now(timezone.utc),
         nullable=False,
+        index=True,  # нужно для recovery daemon (WHERE updated_at < bound)
     )
 
 
@@ -114,7 +119,13 @@ class HttpClientManager:
 
     def start(self) -> None:
         self.client = httpx.AsyncClient(
-            timeout=httpx.Timeout(HTTP_TIMEOUT, connect=2.0),
+            timeout=httpx.Timeout(
+                timeout=HTTP_TIMEOUT,
+                connect=2.0,
+                read=HTTP_TIMEOUT,
+                write=HTTP_TIMEOUT,
+                pool=2.0,
+            ),
             limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
         )
 
@@ -131,11 +142,15 @@ active_tasks: Set[asyncio.Task] = set()
 _UNSET = object()
 
 
-def _sanitize_log(value: str) -> str:
-    return re.sub(r"[\r\n\t]", " ", value)[:255]
+def _sanitize_log(value: str, limit: int = 500) -> str:
+    """Убираем управляющие символы и обрезаем до limit."""
+    if value is None:
+        return ""
+    return re.sub(r"[\r\n\t]", " ", str(value))[:limit]
 
 
 def _handle_task_result(task: asyncio.Task) -> None:
+    active_tasks.discard(task)
     try:
         task.result()
     except asyncio.CancelledError:
@@ -147,9 +162,21 @@ def _handle_task_result(task: asyncio.Task) -> None:
 def run_background_task(coro) -> asyncio.Task:
     task = asyncio.create_task(coro)
     active_tasks.add(task)
-    task.add_done_callback(active_tasks.discard)
     task.add_done_callback(_handle_task_result)
     return task
+
+
+# ---------------- Rate limit ----------------
+_rate_store: dict[str, list[float]] = defaultdict(list)
+
+
+def check_order_rate(ip: str) -> bool:
+    now = _time()
+    _rate_store[ip] = [t for t in _rate_store[ip] if now - t < ORDER_RATE_WINDOW]
+    if len(_rate_store[ip]) >= ORDER_RATE_LIMIT:
+        return False
+    _rate_store[ip].append(now)
+    return True
 
 
 # ---------------- Sync engine ----------------
@@ -161,14 +188,19 @@ class ResilientSyncEngine:
         status: Optional[str] = None,
         error_log=_UNSET,
         attempt: Optional[int] = None,
+        touch_updated_at: bool = True,
     ) -> None:
         values = {}
         if status is not None:
             values["status"] = status
         if error_log is not _UNSET:
-            values["error_log"] = error_log[:500] if error_log else None
+            values["error_log"] = _sanitize_log(error_log, 500) if error_log else None
         if attempt is not None:
             values["attempt"] = attempt
+        if touch_updated_at:
+            # Явно, потому что SQLAlchemy onupdate не всегда срабатывает
+            # через session.execute(update(...))
+            values["updated_at"] = datetime.now(timezone.utc)
         if not values:
             return
         async with AsyncSessionLocal() as session:
@@ -229,13 +261,19 @@ class ResilientSyncEngine:
                 err = f"internal: {type(e).__name__}"
                 retryable = False
 
-            await self._persist(order_id, error_log=err, attempt=attempt)
-
+            # Финальная попытка или неретраимая ошибка → один UPDATE
             if not retryable or attempt == max_retries:
-                await self._persist(order_id, status="CRITICAL_FAILED")
+                await self._persist(
+                    order_id,
+                    status="CRITICAL_FAILED",
+                    error_log=err,
+                    attempt=attempt,
+                )
                 logger.error("[SYNC-FAILED] job=%s err=%s", order_id, err)
                 return False
 
+            # Промежуточная запись — только ошибка и номер попытки
+            await self._persist(order_id, error_log=err, attempt=attempt)
             await asyncio.sleep(delay)
             delay *= 2
         return False
@@ -268,10 +306,19 @@ async def auto_recovery_daemon() -> None:
                         .limit(RECOVERY_BATCH)
                         .scalar_subquery()
                     )
+                    # ВАЖНО: защита от race condition между воркерами.
+                    # Обновляем только те, что ещё не в RECOVERING.
+                    # В single-worker SQLite это подстраховка,
+                    # в multi-worker Postgres — обязательное условие.
                     stmt = (
                         update(OutboxModel)
                         .where(OutboxModel.order_id.in_(subq))
-                        .values(status="RECOVERING", attempt=0)
+                        .where(OutboxModel.status != "RECOVERING")
+                        .values(
+                            status="RECOVERING",
+                            attempt=0,
+                            updated_at=datetime.now(timezone.utc),
+                        )
                         .returning(OutboxModel.order_id)
                     )
                     claimed = (await session.execute(stmt)).scalars().all()
@@ -326,7 +373,6 @@ async def lifespan(app: FastAPI):
     recovery: Optional[asyncio.Task] = None
     cleaner: Optional[asyncio.Task] = None
     try:
-        # Для SQLite create_all — норма. Для прода с Postgres — Alembic.
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
 
@@ -372,9 +418,18 @@ def _payload_hash(payload: OrderIn) -> str:
 @app.post("/api/v1/orders")
 async def create_secure_order(
     payload: OrderIn,
+    request: Request,
     response: Response,
     x_idempotency_key: Optional[str] = Header(None, max_length=255),
 ):
+    # Rate limit по IP
+    client_ip = request.client.host if request.client else "unknown"
+    if not check_order_rate(client_ip):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many requests. Slow down.",
+        )
+
     generated_id = uuid.uuid4().hex
     payload_hash = _payload_hash(payload)
     idem_key = x_idempotency_key
@@ -396,7 +451,10 @@ async def create_secure_order(
                             status_code=409,
                             detail="Idempotency key reused with different payload",
                         )
-                    logger.info("[IDEMPOTENT] replay key=%s", _sanitize_log(idem_key))
+                    logger.info(
+                        "[IDEMPOTENT] replay key=%s",
+                        _sanitize_log(idem_key, 255),
+                    )
                     response.status_code = 200
                     return {
                         "status": "accepted",
